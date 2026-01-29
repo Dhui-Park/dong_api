@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>주소 관할동 찾기_v2</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        padding: 20px;
+      }
+
+      .container {
+        background: white;
+        border-radius: 20px;
+        padding: 40px;
+        max-width: 600px;
+        width: 100%;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      }
+
+      h1 {
+        text-align: center;
+        color: #333;
+        margin-bottom: 10px;
+        font-size: 1.8rem;
+      }
+
+      .subtitle {
+        text-align: center;
+        color: #666;
+        margin-bottom: 30px;
+        font-size: 0.95rem;
+      }
+
+      .upload-area {
+        border: 3px dashed #667eea;
+        border-radius: 15px;
+        padding: 40px;
+        text-align: center;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        background: #f8f9ff;
+      }
+
+      .upload-area:hover {
+        background: #eef0ff;
+        border-color: #764ba2;
+      }
+
+      .upload-area.dragover {
+        background: #e0e5ff;
+        border-color: #764ba2;
+      }
+
+      .upload-icon {
+        font-size: 3rem;
+        margin-bottom: 15px;
+      }
+
+      .upload-text {
+        color: #555;
+        font-size: 1.1rem;
+      }
+
+      .upload-hint {
+        color: #888;
+        font-size: 0.85rem;
+        margin-top: 10px;
+      }
+
+      #fileInput {
+        display: none;
+      }
+
+      .file-info {
+        background: #f0f0f0;
+        padding: 15px;
+        border-radius: 10px;
+        margin-top: 20px;
+        display: none;
+      }
+
+      .file-info.show {
+        display: block;
+      }
+
+      .file-name {
+        font-weight: bold;
+        color: #333;
+      }
+
+      .btn {
+        display: block;
+        width: 100%;
+        padding: 15px;
+        border: none;
+        border-radius: 10px;
+        font-size: 1.1rem;
+        cursor: pointer;
+        margin-top: 20px;
+        transition: all 0.3s ease;
+      }
+
+      .btn-primary {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+      }
+
+      .btn-primary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+      }
+
+      .btn-primary:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+      }
+
+      .status {
+        text-align: center;
+        margin-top: 20px;
+        padding: 15px;
+        border-radius: 10px;
+        display: none;
+      }
+
+      .status.show {
+        display: block;
+      }
+
+      .status.processing {
+        background: #fff3cd;
+        color: #856404;
+      }
+
+      .status.success {
+        background: #d4edda;
+        color: #155724;
+      }
+
+      .status.error {
+        background: #f8d7da;
+        color: #721c24;
+      }
+
+      .spinner {
+        display: inline-block;
+        width: 20px;
+        height: 20px;
+        border: 3px solid #f3f3f3;
+        border-top: 3px solid #667eea;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        margin-right: 10px;
+        vertical-align: middle;
+      }
+
+      @keyframes spin {
+        0% {
+          transform: rotate(0deg);
+        }
+        100% {
+          transform: rotate(360deg);
+        }
+      }
+
+      .instructions {
+        margin-top: 30px;
+        padding: 20px;
+        background: #f8f9fa;
+        border-radius: 10px;
+      }
+
+      .instructions h3 {
+        color: #333;
+        margin-bottom: 10px;
+        font-size: 1rem;
+      }
+
+      .instructions ul {
+        color: #666;
+        padding-left: 20px;
+        font-size: 0.9rem;
+      }
+
+      .instructions li {
+        margin-bottom: 5px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>주소 관할동 찾기_v2</h1>
+      <p class="subtitle">
+        엑셀 파일의 주소로 관할 동사무소를 자동으로 찾아드립니다
+      </p>
+      <p class="subtitle">('거제', '읍면' 버그 수정)</p>
+
+      <div class="upload-area" id="uploadArea">
+        <div class="upload-icon">📁</div>
+        <div class="upload-text">파일을 여기에 드래그하거나 클릭하세요</div>
+        <div class="upload-hint">.xlsx, .xls, .csv 파일 지원</div>
+        <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+      </div>
+
+      <div class="file-info" id="fileInfo">
+        <span class="file-name" id="fileName"></span>
+      </div>
+
+      <button class="btn btn-primary" id="processBtn" disabled>
+        변환 시작
+      </button>
+
+      <div class="status" id="status"></div>
+
+      <div class="instructions">
+        <h3>사용 방법</h3>
+        <ul>
+          <li>엑셀 파일에 <strong>'주소'</strong> 컬럼이 있어야 합니다</li>
+          <li>각 주소에 대해 관할동, 시군구, 시도 정보가 추가됩니다</li>
+          <li>처리 완료 후 자동으로 결과 파일이 다운로드됩니다</li>
+        </ul>
+      </div>
+    </div>
+
+    <script>
+      const uploadArea = document.getElementById("uploadArea");
+      const fileInput = document.getElementById("fileInput");
+      const fileInfo = document.getElementById("fileInfo");
+      const fileName = document.getElementById("fileName");
+      const processBtn = document.getElementById("processBtn");
+      const status = document.getElementById("status");
+
+      let selectedFile = null;
+
+      uploadArea.addEventListener("click", () => fileInput.click());
+
+      uploadArea.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        uploadArea.classList.add("dragover");
+      });
+
+      uploadArea.addEventListener("dragleave", () => {
+        uploadArea.classList.remove("dragover");
+      });
+
+      uploadArea.addEventListener("drop", (e) => {
+        e.preventDefault();
+        uploadArea.classList.remove("dragover");
+        const files = e.dataTransfer.files;
+        if (files.length > 0) {
+          handleFile(files[0]);
+        }
+      });
+
+      fileInput.addEventListener("change", (e) => {
+        if (e.target.files.length > 0) {
+          handleFile(e.target.files[0]);
+        }
+      });
+
+      function handleFile(file) {
+        if (!file.name.match(/\.(xlsx|xls|csv)$/i)) {
+          showStatus(
+            "엑셀 또는 CSV 파일(.xlsx, .xls, .csv)만 업로드 가능합니다",
+            "error"
+          );
+          return;
+        }
+        selectedFile = file;
+        fileName.textContent = file.name;
+        fileInfo.classList.add("show");
+        processBtn.disabled = false;
+        hideStatus();
+      }
+
+      processBtn.addEventListener("click", async () => {
+        if (!selectedFile) return;
+
+        processBtn.disabled = true;
+        showStatus(
+          '<span class="spinner"></span>처리 중입니다... 잠시만 기다려주세요',
+          "processing"
+        );
+
+        const formData = new FormData();
+        formData.append("file", selectedFile);
+
+        try {
+          const response = await fetch("/api/process-excel", {
+            method: "POST",
+            body: formData,
+          });
+
+          if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || "처리 중 오류가 발생했습니다");
+          }
+
+          const blob = await response.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download =
+            "result_" +
+            selectedFile.name.replace(/\.(xlsx|xls|csv)$/i, ".xlsx");
+          document.body.appendChild(a);
+          a.click();
+          window.URL.revokeObjectURL(url);
+          a.remove();
+
+          showStatus("처리 완료! 파일이 다운로드되었습니다", "success");
+        } catch (error) {
+          showStatus(error.message, "error");
+        } finally {
+          processBtn.disabled = false;
+        }
+      });
+
+      function showStatus(message, type) {
+        status.innerHTML = message;
+        status.className = "status show " + type;
+      }
+
+      function hideStatus() {
+        status.className = "status";
+      }
+    </script>
+  </body>
+</html>
