@@ -156,8 +156,8 @@ app.post("/api/process-excel", upload.single("file"), async (req, res) => {
     }
 
     // '열람 동사무소' 컬럼 존재 여부 확인
-    const dongOfficeColumn = Object.keys(data[0]).find(
-      (key) => key === "열람 동사무소(조사업체)"
+    const dongOfficeColumn = Object.keys(data[0]).find((key) =>
+      key.includes("열람 동사무소")
     );
 
     // '열람 동사무소' 값에 '동' 붙이기 함수
