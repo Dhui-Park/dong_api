@@ -8,14 +8,45 @@ const iconv = require("iconv-lite");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const EXCEL_MIME_TYPE =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB 제한
+  },
+});
 
 app.use(express.static("public"));
 app.use(express.json());
 
 const JUSO_API_URL = "https://business.juso.go.kr/addrlink/addrLinkApi.do";
 const JUSO_API_KEY = process.env.JUSO_CONFIRM_KEY;
+
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+function sendApiError(res, status, message, code) {
+  const payload = { error: message };
+  if (code) {
+    payload.code = code;
+  }
+  return res.status(status).json(payload);
+}
+
+function logApiError(context, error, details = {}) {
+  const errorName = error?.name || "Error";
+  const message = error?.message || String(error);
+  console.error(`[${context}]`, {
+    name: errorName,
+    message,
+    ...details,
+  });
+}
 
 function preprocessAddress(address) {
   // "외N필지" 또는 "외 N필지" 패턴이 있으면 그 앞부분만 남김
@@ -121,10 +152,17 @@ async function searchAddress(keyword) {
   return { success: false, error: "주소를 찾을 수 없습니다" };
 }
 
-app.post("/api/process-excel", upload.single("file"), async (req, res) => {
-  try {
+app.post(
+  "/api/process-excel",
+  upload.single("file"),
+  asyncHandler(async (req, res) => {
     if (!req.file) {
-      return res.status(400).json({ error: "파일이 업로드되지 않았습니다" });
+      return sendApiError(
+        res,
+        400,
+        "파일이 업로드되지 않았습니다",
+        "FILE_MISSING"
+      );
     }
 
     let fileBuffer = req.file.buffer;
@@ -142,7 +180,12 @@ app.post("/api/process-excel", upload.single("file"), async (req, res) => {
     const data = xlsx.utils.sheet_to_json(worksheet);
 
     if (data.length === 0) {
-      return res.status(400).json({ error: "파일에 데이터가 없습니다" });
+      return sendApiError(
+        res,
+        400,
+        "파일에 데이터가 없습니다",
+        "EMPTY_FILE"
+      );
     }
 
     const addressColumn = Object.keys(data[0]).find(
@@ -152,7 +195,12 @@ app.post("/api/process-excel", upload.single("file"), async (req, res) => {
     );
 
     if (!addressColumn) {
-      return res.status(400).json({ error: "'주소' 컬럼을 찾을 수 없습니다" });
+      return sendApiError(
+        res,
+        400,
+        "'주소' 컬럼을 찾을 수 없습니다",
+        "ADDRESS_COLUMN_MISSING"
+      );
     }
 
     // '열람 동사무소' 컬럼 존재 여부 확인
@@ -247,27 +295,80 @@ app.post("/api/process-excel", upload.single("file"), async (req, res) => {
       bookType: "xlsx",
     });
 
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
+    res.setHeader("Content-Type", EXCEL_MIME_TYPE);
     res.setHeader("Content-Disposition", "attachment; filename=result.xlsx");
     res.send(buffer);
-  } catch (error) {
-    console.error("Error processing file:", error);
-    res
-      .status(500)
-      .json({ error: "파일 처리 중 오류가 발생했습니다: " + error.message });
+  })
+);
+
+// multer 에러 핸들러
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    logApiError("upload", error, {
+      path: req.originalUrl,
+      fileName: req.file?.originalname || req.body?.fileName || null,
+    });
+
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return sendApiError(
+        res,
+        413,
+        "파일이 너무 큽니다. 10MB 이하의 파일을 사용해주세요.",
+        "FILE_TOO_LARGE"
+      );
+    }
+    return sendApiError(
+      res,
+      400,
+      `파일 업로드 오류: ${error.message}`,
+      error.code || "UPLOAD_ERROR"
+    );
   }
+  next(error);
 });
 
-app.post("/api/search", async (req, res) => {
+app.post("/api/search", asyncHandler(async (req, res) => {
   const { keyword } = req.body;
   if (!keyword) {
-    return res.status(400).json({ error: "검색어가 필요합니다" });
+    return sendApiError(res, 400, "검색어가 필요합니다", "KEYWORD_MISSING");
   }
   const result = await searchAddress(keyword);
   res.json(result);
+}));
+
+app.use("/api", (req, res) => {
+  sendApiError(
+    res,
+    404,
+    `요청한 API를 찾을 수 없습니다: ${req.method} ${req.originalUrl}`,
+    "API_NOT_FOUND"
+  );
+});
+
+app.use((error, req, res, next) => {
+  const status = error.status || error.statusCode || 500;
+  const code = error.code || "INTERNAL_SERVER_ERROR";
+  const isApiRequest = req.originalUrl.startsWith("/api");
+
+  logApiError("api", error, {
+    path: req.originalUrl,
+    method: req.method,
+    status,
+    fileName: req.file?.originalname || null,
+  });
+
+  if (isApiRequest) {
+    return sendApiError(
+      res,
+      status,
+      status >= 500
+        ? "파일 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+        : error.message,
+      code
+    );
+  }
+
+  next(error);
 });
 
 app.listen(PORT, () => {
