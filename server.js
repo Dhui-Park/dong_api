@@ -402,13 +402,11 @@ app.post(
         // 관할동이 "제동"으로 끝나는 경우 (예: "화곡제동")
         // → "제제{숫자}동" 패턴일 때만 '제' 한 글자 제거 (제제1동 → 제1동)
         if (/제동$/.test(gwanhalDong)) {
-          resultRow["열람 동사무소_api용"] = officeApiValue.replace(
-            /제제([0-9])동/g,
-            "제$1동"
-          );
+          resultRow["열람 동사무소_api결과가_아닌_맞춰보려고_편집한_거"] =
+            officeApiValue.replace(/제제([0-9])동/g, "제$1동");
         } else {
           // 기존 로직: "제{숫자}동" → "{숫자}동"
-          resultRow["열람 동사무소_api용"] =
+          resultRow["열람 동사무소_api결과가_아닌_맞춰보려고_편집한_거"] =
             removeJePrefixIfNeeded(officeApiValue);
         }
       }
