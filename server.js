@@ -10,6 +10,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const EXCEL_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const JUSO_API_TIMEOUT_MS = 3000;
+const DIAGNOSTIC_OLD_SEARCH = process.env.DIAGNOSTIC_OLD_SEARCH === "true";
+const DIAGNOSTIC_VERBOSE = process.env.DIAGNOSTIC_VERBOSE === "true";
+const DIAGNOSTIC_SLOW_ROW_MS = 3000;
+const DIAGNOSTIC_RETRY_HEAVY_COUNT = 4;
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -55,11 +60,6 @@ function preprocessAddress(address) {
     .trim();
 }
 
-/**
- * backoff 전에 토큰화를 더 촘촘히:
- * - 공백 기준 단어로 나눈 뒤
- * - 단어가 숫자로 시작하고 뒤에 문자가 붙으면 "숫자" + "문자"로 분리
- */
 function tokenizeForBackoff(text) {
   const raw = String(text).trim().split(/\s+/);
   const tokens = [];
@@ -72,6 +72,7 @@ function tokenizeForBackoff(text) {
       tokens.push(t);
     }
   }
+
   return tokens;
 }
 
@@ -90,6 +91,89 @@ function removeJePrefixIfNeeded(value) {
   return s.replace(/제([0-9])동/g, "$1동");
 }
 
+function getAddressErrorMessage(error) {
+  if (error?.code === "ECONNABORTED") {
+    return "주소 조회 시간 초과";
+  }
+
+  return error?.message || "주소 조회 중 오류가 발생했습니다";
+}
+
+function normalizeSearchResult(searchResult) {
+  if (searchResult.success) {
+    return "성공";
+  }
+
+  const error = String(searchResult.error || "").trim();
+
+  if (!error || error === "정상" || error === "주소를 찾을 수 없습니다") {
+    return "미매칭";
+  }
+
+  if (error.includes("검색어가 너무 깁니다")) {
+    return "검색어 초과";
+  }
+
+  if (error === "주소 조회 시간 초과") {
+    return "조회 시간 초과";
+  }
+
+  if (error === "주소가 비어 있습니다") {
+    return "주소 없음";
+  }
+
+  return "조회 오류";
+}
+
+function createDiagnosticContext(req, totalRows) {
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  return {
+    enabled: DIAGNOSTIC_OLD_SEARCH,
+    verbose: DIAGNOSTIC_VERBOSE,
+    requestId,
+    startedAt: Date.now(),
+    totalRows,
+    fileName: req.file?.originalname || "",
+    lastStartedRow: null,
+    lastCompletedRow: null,
+    rowSummaries: [],
+    failedRowsCount: 0,
+  };
+}
+
+function logDiagnostic(context, message, details = {}) {
+  if (!context?.enabled) {
+    return;
+  }
+
+  console.log(`[diagnostic:${context.requestId}] ${message}`, details);
+}
+
+function getTopRows(rowSummaries, field, limit = 3) {
+  return [...rowSummaries]
+    .filter((row) => Number(row[field]) > 0)
+    .sort((a, b) => b[field] - a[field])
+    .slice(0, limit)
+    .map(
+      ({
+        rowNumber,
+        sourceRowNumber,
+        status,
+        elapsedMs,
+        attemptCount,
+        address,
+      }) => ({
+        rowNumber,
+        sourceRowNumber,
+        status,
+        elapsedMs,
+        attemptCount,
+        address,
+      })
+    );
+}
+
 // 단일 API 호출
 async function searchAddressOnce(keyword) {
   try {
@@ -102,6 +186,7 @@ async function searchAddressOnce(keyword) {
         resultType: "json",
         addInfoYn: "Y",
       },
+      timeout: JUSO_API_TIMEOUT_MS,
     });
 
     const result = response.data?.results;
@@ -122,34 +207,65 @@ async function searchAddressOnce(keyword) {
       error: result?.common?.errorMessage || "주소를 찾을 수 없습니다",
     };
   } catch (error) {
-    return { success: false, error: error.message };
+    return { success: false, error: getAddressErrorMessage(error) };
   }
 }
 
-// 검색 실패 시 마지막 토큰부터 제거하며 재시도
-async function searchAddress(keyword) {
-  // 1. 전처리 (외N필지 패턴 제거)
-  let processed = preprocessAddress(keyword);
-
-  // 2. 첫 번째 시도
-  let result = await searchAddressOnce(processed);
-  if (result.success) {
-    return result;
+async function searchAddressWithBackoff(keyword, diagnosticContext) {
+  const processed = preprocessAddress(keyword);
+  if (!processed) {
+    return { success: false, error: "주소가 비어 있습니다", attemptCount: 0 };
   }
 
-  // 3. 실패 시: 토큰화 후 마지막 토큰부터 하나씩 제거하며 재시도
-  let tokens = tokenizeForBackoff(processed);
+  let attempt = 1;
+  let result = await searchAddressOnce(processed);
+  if (diagnosticContext?.verbose) {
+    logDiagnostic(diagnosticContext, "search attempt", {
+      attempt,
+      keyword: processed,
+      success: result.success,
+      error: result.success ? null : result.error,
+    });
+  }
 
+  if (result.success) {
+    return { ...result, attemptCount: attempt };
+  }
+
+  const tokens = tokenizeForBackoff(processed);
   while (tokens.length > 1) {
     tokens.pop();
+    attempt += 1;
     const shortened = tokens.join(" ").trim();
     result = await searchAddressOnce(shortened);
+    if (diagnosticContext?.verbose) {
+      logDiagnostic(diagnosticContext, "search attempt", {
+        attempt,
+        keyword: shortened,
+        success: result.success,
+        error: result.success ? null : result.error,
+      });
+    }
+
     if (result.success) {
-      return result;
+      return { ...result, attemptCount: attempt };
     }
   }
 
-  return { success: false, error: "주소를 찾을 수 없습니다" };
+  return {
+    success: false,
+    error: "주소를 찾을 수 없습니다",
+    attemptCount: attempt,
+  };
+}
+
+async function searchAddress(keyword, diagnosticContext) {
+  const processed = preprocessAddress(keyword);
+  if (!processed) {
+    return { success: false, error: "주소가 비어 있습니다", attemptCount: 0 };
+  }
+
+  return searchAddressWithBackoff(processed, diagnosticContext);
 }
 
 app.post(
@@ -178,14 +294,10 @@ app.post(
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
     const data = xlsx.utils.sheet_to_json(worksheet);
+    const diagnosticContext = createDiagnosticContext(req, data.length);
 
     if (data.length === 0) {
-      return sendApiError(
-        res,
-        400,
-        "파일에 데이터가 없습니다",
-        "EMPTY_FILE"
-      );
+      return sendApiError(res, 400, "파일에 데이터가 없습니다", "EMPTY_FILE");
     }
 
     const addressColumn = Object.keys(data[0]).find(
@@ -221,14 +333,32 @@ app.post(
     }
 
     const results = [];
+    const addressCache = new Map();
+    logDiagnostic(diagnosticContext, "request started", {
+      totalRows: data.length,
+      fileName: diagnosticContext.fileName,
+    });
+
     for (let i = 0; i < data.length; i++) {
       const row = data[i];
       const address = row[addressColumn];
+      const rowNumber = i + 1;
+      const sourceRowNumber = row["연번"] ?? null;
+      const rowStartedAt = Date.now();
+      let attemptCount = 0;
 
       const resultRow = { ...row };
+      diagnosticContext.lastStartedRow = rowNumber;
 
       if (address) {
-        const searchResult = await searchAddress(address);
+        const cacheKey = preprocessAddress(address);
+        let searchResult = addressCache.get(cacheKey);
+
+        if (!searchResult) {
+          searchResult = await searchAddress(address, diagnosticContext);
+          addressCache.set(cacheKey, searchResult);
+        }
+        attemptCount = searchResult.attemptCount || 0;
 
         resultRow.관할동 = searchResult.success ? searchResult.emdNm : "";
         resultRow.시군구 = searchResult.success ? searchResult.sggNm : "";
@@ -254,7 +384,7 @@ app.post(
           resultRow.관할동사무소 = removeJePrefixIfNeeded(dongOfficeRaw);
         }
 
-        resultRow.검색결과 = searchResult.success ? "성공" : searchResult.error;
+        resultRow.검색결과 = normalizeSearchResult(searchResult);
       } else {
         resultRow.관할동 = "";
         resultRow.시군구 = "";
@@ -284,6 +414,31 @@ app.post(
       }
 
       results.push(resultRow);
+      diagnosticContext.lastCompletedRow = rowNumber;
+      const rowSummary = {
+        rowNumber,
+        sourceRowNumber,
+        address,
+        status: resultRow.검색결과,
+        elapsedMs: Date.now() - rowStartedAt,
+        attemptCount,
+      };
+      diagnosticContext.rowSummaries.push(rowSummary);
+
+      if (rowSummary.status !== "성공") {
+        diagnosticContext.failedRowsCount += 1;
+      }
+
+      if (rowSummary.elapsedMs >= DIAGNOSTIC_SLOW_ROW_MS) {
+        logDiagnostic(diagnosticContext, "slow row", rowSummary);
+      } else if (rowSummary.attemptCount >= DIAGNOSTIC_RETRY_HEAVY_COUNT) {
+        logDiagnostic(diagnosticContext, "retry-heavy row", rowSummary);
+      } else if (
+        rowSummary.status !== "성공" &&
+        rowSummary.status !== "주소 없음"
+      ) {
+        logDiagnostic(diagnosticContext, "failed row", rowSummary);
+      }
     }
 
     const newWorkbook = xlsx.utils.book_new();
@@ -297,6 +452,18 @@ app.post(
 
     res.setHeader("Content-Type", EXCEL_MIME_TYPE);
     res.setHeader("Content-Disposition", "attachment; filename=result.xlsx");
+    logDiagnostic(diagnosticContext, "request completed summary", {
+      totalRows: data.length,
+      totalElapsedMs: Date.now() - diagnosticContext.startedAt,
+      lastStartedRow: diagnosticContext.lastStartedRow,
+      lastCompletedRow: diagnosticContext.lastCompletedRow,
+      failedRowsCount: diagnosticContext.failedRowsCount,
+      slowestRows: getTopRows(diagnosticContext.rowSummaries, "elapsedMs"),
+      mostRetriedRows: getTopRows(
+        diagnosticContext.rowSummaries,
+        "attemptCount"
+      ),
+    });
     res.send(buffer);
   })
 );
@@ -327,14 +494,17 @@ app.use((error, req, res, next) => {
   next(error);
 });
 
-app.post("/api/search", asyncHandler(async (req, res) => {
-  const { keyword } = req.body;
-  if (!keyword) {
-    return sendApiError(res, 400, "검색어가 필요합니다", "KEYWORD_MISSING");
-  }
-  const result = await searchAddress(keyword);
-  res.json(result);
-}));
+app.post(
+  "/api/search",
+  asyncHandler(async (req, res) => {
+    const { keyword } = req.body;
+    if (!keyword) {
+      return sendApiError(res, 400, "검색어가 필요합니다", "KEYWORD_MISSING");
+    }
+    const result = await searchAddress(keyword);
+    res.json(result);
+  })
+);
 
 app.use("/api", (req, res) => {
   sendApiError(
