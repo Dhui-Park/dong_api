@@ -204,7 +204,7 @@
   </head>
   <body>
     <div class="container">
-      <h1>주소 관할동 찾기_v4.1</h1>
+      <h1>주소 관할동 찾기_v5.1</h1>
       <p class="subtitle">
         엑셀 파일의 주소로 관할 동사무소를 자동으로 찾아드립니다
       </p>
@@ -214,6 +214,10 @@
         업데이트)
       </p>
       <p class="subtitle">( 260420 api 호출 시 병목현상 업데이트 )</p>
+      <p class="subtitle">
+        ( 260519 병목현상 재발 -> 1차 빠른 모드로 api 호출 -> 2차 정밀 모드로
+        api 호출 )
+      </p>
 
       <div class="upload-area" id="uploadArea">
         <div class="upload-icon">📁</div>
@@ -253,6 +257,8 @@
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
       let selectedFile = null;
+      let activeJobId = null;
+      let statusPollTimer = null;
 
       uploadArea.addEventListener("click", () => fileInput.click());
 
@@ -308,6 +314,91 @@
         );
       }
 
+      async function fetchLatestProcessStatus() {
+        try {
+          const response = await fetch("/api/process-status/latest", {
+            cache: "no-store",
+          });
+
+          if (!response.ok) {
+            return null;
+          }
+
+          return await response.json();
+        } catch (error) {
+          return null;
+        }
+      }
+
+      async function fetchJobStatus(jobId) {
+        const response = await fetch(`/api/process-excel-jobs/${jobId}`, {
+          cache: "no-store",
+        });
+
+        if (!response.ok) {
+          throw new Error(await getErrorMessage(response));
+        }
+
+        return await response.json();
+      }
+
+      function formatProcessStatusMessage(status, responseStatus) {
+        const lines = [`서버 오류 (${responseStatus})`];
+
+        if (typeof status.lastCompletedRow === "number") {
+          lines.push(`마지막 완료 행: ${status.lastCompletedRow}`);
+        }
+
+        if (typeof status.lastStartedRow === "number") {
+          lines.push(`마지막 시작 행: ${status.lastStartedRow}`);
+        }
+
+        if (status.likelyCause) {
+          lines.push(`추정 원인: ${status.likelyCause}`);
+        }
+
+        if (status.lastAddress) {
+          lines.push(`마지막 주소: ${status.lastAddress}`);
+        }
+
+        return lines.join("<br>");
+      }
+
+      function formatJobStatusMessage(job) {
+        const lines = [
+          '<span class="spinner"></span>자동 2단계 처리 중입니다...',
+        ];
+
+        if (job.phase === "fast") {
+          lines.push(
+            `1차 빠른 처리: ${job.fastCompletedRows || 0} / ${
+              job.totalRows || 0
+            }`
+          );
+        } else if (job.phase === "precise") {
+          lines.push(
+            `1차 빠른 처리 완료: ${job.totalRows || 0} / ${job.totalRows || 0}`
+          );
+          lines.push(
+            `2차 정밀 재처리: ${job.preciseCompletedRows || 0} / ${
+              job.preciseTargetRows || 0
+            }`
+          );
+        } else if (job.phase === "completed") {
+          lines.push("완료: 결과 파일을 준비했습니다.");
+        }
+
+        if (typeof job.lastCompletedRow === "number") {
+          lines.push(`마지막 완료 행: ${job.lastCompletedRow}`);
+        }
+
+        if (job.likelyCause) {
+          lines.push(`상태: ${job.likelyCause}`);
+        }
+
+        return lines.join("<br>");
+      }
+
       async function getErrorMessage(response) {
         if (isJsonResponse(response)) {
           try {
@@ -331,18 +422,95 @@
           normalized.startsWith("<!doctype html") ||
           normalized.startsWith("<html")
         ) {
-          return `서버 오류 (${response.status}): 서버가 예상하지 못한 형식으로 응답했습니다. 잠시 후 다시 시도해주세요.`;
+          const processStatus = await fetchLatestProcessStatus();
+
+          if (processStatus) {
+            return formatProcessStatusMessage(processStatus, response.status);
+          }
+
+          return `서버 오류 (${response.status}): 서버가 중간에 응답을 종료했습니다. 잠시 후 다시 시도해주세요.`;
         }
 
         return `서버 오류 (${response.status}): 파일 처리에 실패했습니다.`;
       }
 
+      async function downloadJobResult(jobId) {
+        const response = await fetch(
+          `/api/process-excel-jobs/${jobId}/download`
+        );
+
+        if (!response.ok) {
+          throw new Error(await getErrorMessage(response));
+        }
+
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "result.xlsx";
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        a.remove();
+      }
+
+      function stopStatusPolling() {
+        if (statusPollTimer) {
+          clearTimeout(statusPollTimer);
+          statusPollTimer = null;
+        }
+      }
+
+      async function pollJobStatus(jobId) {
+        try {
+          const job = await fetchJobStatus(jobId);
+
+          if (job.status === "completed") {
+            stopStatusPolling();
+            await downloadJobResult(jobId);
+            showStatus("처리 완료! 파일이 다운로드되었습니다", "success");
+            processBtn.disabled = false;
+            activeJobId = null;
+            return;
+          }
+
+          if (job.status === "failed") {
+            stopStatusPolling();
+            processBtn.disabled = false;
+            activeJobId = null;
+            showStatus(
+              [
+                "작업이 중단되었습니다.",
+                typeof job.lastCompletedRow === "number"
+                  ? `마지막 완료 행: ${job.lastCompletedRow}`
+                  : null,
+                job.likelyCause ? `추정 원인: ${job.likelyCause}` : null,
+                job.error ? `오류: ${job.error}` : null,
+              ]
+                .filter(Boolean)
+                .join("<br>"),
+              "error"
+            );
+            return;
+          }
+
+          showStatus(formatJobStatusMessage(job), "processing");
+          statusPollTimer = setTimeout(() => pollJobStatus(jobId), 1500);
+        } catch (error) {
+          stopStatusPolling();
+          processBtn.disabled = false;
+          activeJobId = null;
+          showStatus(error.message, "error");
+        }
+      }
+
       processBtn.addEventListener("click", async () => {
         if (!selectedFile) return;
 
+        stopStatusPolling();
         processBtn.disabled = true;
         showStatus(
-          '<span class="spinner"></span>처리 중입니다... 잠시만 기다려주세요',
+          '<span class="spinner"></span>작업을 생성하는 중입니다...',
           "processing"
         );
 
@@ -350,7 +518,7 @@
         formData.append("file", selectedFile);
 
         try {
-          const response = await fetch("/api/process-excel", {
+          const response = await fetch("/api/process-excel-jobs", {
             method: "POST",
             body: formData,
           });
@@ -359,26 +527,15 @@
             throw new Error(await getErrorMessage(response));
           }
 
-          if (!isExcelResponse(response)) {
-            throw new Error(await getErrorMessage(response));
-          }
-
-          const blob = await response.blob();
-          const url = window.URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download =
-            "result_" +
-            selectedFile.name.replace(/\.(xlsx|xls|csv)$/i, ".xlsx");
-          document.body.appendChild(a);
-          a.click();
-          window.URL.revokeObjectURL(url);
-          a.remove();
-
-          showStatus("처리 완료! 파일이 다운로드되었습니다", "success");
+          const payload = await response.json();
+          activeJobId = payload.jobId;
+          showStatus(
+            '<span class="spinner"></span>처리를 시작했습니다. 진행 상황을 확인하는 중입니다...',
+            "processing"
+          );
+          await pollJobStatus(activeJobId);
         } catch (error) {
           showStatus(error.message, "error");
-        } finally {
           processBtn.disabled = false;
         }
       });
