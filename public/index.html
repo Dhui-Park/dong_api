@@ -434,6 +434,28 @@
         return `서버 오류 (${response.status}): 파일 처리에 실패했습니다.`;
       }
 
+      function sanitizeClientDownloadName(name) {
+        const normalized = String(name || "result.xlsx")
+          .replace(/[^\x20-\x7E]/g, "_")
+          .replace(/["\\;,\r\n/]/g, "_")
+          .replace(/\s+/g, "_")
+          .replace(/_+/g, "_")
+          .replace(/^_+|_+$/g, "");
+
+        return normalized || "result.xlsx";
+      }
+
+      function buildClientDownloadName(originalFileName) {
+        const base =
+          "result_" +
+          String(originalFileName || "result.xlsx").replace(
+            /\.(xlsx|xls|csv)$/i,
+            ".xlsx"
+          );
+
+        return sanitizeClientDownloadName(base);
+      }
+
       async function downloadJobResult(jobId) {
         const response = await fetch(
           `/api/process-excel-jobs/${jobId}/download`
@@ -447,7 +469,7 @@
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = "result.xlsx";
+        a.download = buildClientDownloadName(selectedFile?.name);
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
