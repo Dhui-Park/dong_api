@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "start:large": "node --expose-gc --max-old-space-size=4096 server.js"
   },
   "dependencies": {
     "axios": "^1.6.0",

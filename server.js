@@ -304,6 +304,15 @@ function getLatestJob() {
   return latestJobId ? getJob(latestJobId) : null;
 }
 
+function clearPreviousJobs() {
+  processJobs.clear();
+  latestJobId = null;
+
+  if (typeof global.gc === "function") {
+    global.gc();
+  }
+}
+
 function serializeJob(job) {
   if (!job) {
     return null;
@@ -825,6 +834,8 @@ app.post(
         "FILE_MISSING"
       );
     }
+
+    clearPreviousJobs();
 
     const job = saveJob(
       createJobState({
