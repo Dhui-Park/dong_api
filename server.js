@@ -436,17 +436,18 @@ function buildResultRow(row, searchResult, dongOfficeColumn) {
   }
 
   if (dongOfficeColumn) {
-    const officeApiValue = addDongSuffix(row[dongOfficeColumn]);
+    const originalValue = row[dongOfficeColumn];
     const gwanhalDong = resultRow.관할동 || "";
 
+    resultRow[`${dongOfficeColumn}_원본`] = originalValue;
+
     if (/제동$/.test(gwanhalDong)) {
-      resultRow["열람 동사무소_api용"] = officeApiValue.replace(
+      resultRow[dongOfficeColumn] = String(originalValue ?? "").replace(
         /제제([0-9])동/g,
         "제$1동"
       );
     } else {
-      resultRow["열람 동사무소_api용"] =
-        removeJePrefixIfNeeded(officeApiValue);
+      resultRow[dongOfficeColumn] = removeJePrefixIfNeeded(originalValue);
     }
   }
 
@@ -603,16 +604,6 @@ async function searchAddress(keyword, diagnosticContext) {
   return { ...result, attemptCount: 1 };
 }
 
-function addDongSuffix(value) {
-  if (!value) return "";
-  const trimmed = String(value).trim();
-  if (trimmed === "") return "";
-  if (/[동읍면]$/.test(trimmed)) {
-    return trimmed;
-  }
-  return trimmed + "동";
-}
-
 function buildDownloadFileName(originalName) {
   return `result_${originalName.replace(/\.(xlsx|xls|csv)$/i, ".xlsx")}`;
 }
@@ -707,7 +698,7 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
     }
 
     const dongOfficeColumn = Object.keys(data[0]).find((key) =>
-      key.includes("열람 동사무소")
+      key.replace(/\s+/g, "").includes("열람동사무소")
     );
 
     const results = [];
