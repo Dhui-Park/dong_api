@@ -80,6 +80,58 @@ function tokenizeForBackoff(text) {
   return tokens;
 }
 
+// 원본 주소에 명시된 "동/읍/면/리" 지역명 후보를 추출 (예: "청라동", "가좌동")
+// 숫자가 섞인 토큰("120동", "7동" 같은 아파트 동/호)은 제외한다.
+function extractDongCandidates(text) {
+  return String(text)
+    .trim()
+    .split(/\s+/)
+    .filter((t) => /^[가-힣]{2,}$/.test(t) && /(동|읍|면|리)$/.test(t));
+}
+
+// backoff로 검색어가 짧아지는 과정에서 원본 동 정보가 이미 잘려나갔다면,
+// 검색 결과가 실제로 그 동과 일치하는지 확인한다.
+// (구 이름 등 남은 짧은 검색어가 우연히 건물명 텍스트와 매치되는 오탐을 걸러내기 위함)
+function isPlausibleBackoffMatch(dongCandidates, shortenedKeyword, result) {
+  if (dongCandidates.length === 0) return true;
+  if (dongCandidates.some((d) => shortenedKeyword.includes(d))) return true;
+
+  return dongCandidates.some(
+    (d) =>
+      result.emdNm === d ||
+      result.jibunAddr?.includes(d) ||
+      result.roadAddr?.includes(d)
+  );
+}
+
+// 시/군/구 개편(예: 인천 서구 -> 서해구)으로 옛 구 이름이 더 이상 검색되지 않는 경우를 위해
+// 구/군 토큰 하나를 제거한 검색어를 만든다. 시/도("~시","~도") 토큰과 동/읍/면/리 토큰은 건드리지 않는다.
+function stripSingleGuGunToken(text) {
+  const tokens = String(text).trim().split(/\s+/);
+  const idx = tokens.findIndex((t) => /^[가-힣]{2,}$/.test(t) && /(구|군)$/.test(t));
+  if (idx === -1) return null;
+
+  return [...tokens.slice(0, idx), ...tokens.slice(idx + 1)].join(" ").trim();
+}
+
+// 인천 주소는 구 개편(서구->서해구, 중구/동구->영종구/제물포구/검단구 등)이 잦아
+// tail-backoff가 번지까지 지우기 전에 미리 구 이름을 제거해둔다.
+// ("인천광역시"/"인천" 토큰 바로 다음에 오는 구/군 토큰만 정확히 겨냥해서 제거)
+function stripIncheonGuToken(text) {
+  const tokens = String(text).trim().split(/\s+/);
+  const siIdx = tokens.findIndex((t) => t === "인천광역시" || t === "인천");
+  if (siIdx === -1) return text;
+
+  const guToken = tokens[siIdx + 1];
+  if (!guToken || !(/^[가-힣]{2,}$/.test(guToken) && /(구|군)$/.test(guToken))) {
+    return text;
+  }
+
+  return [...tokens.slice(0, siIdx + 1), ...tokens.slice(siIdx + 2)]
+    .join(" ")
+    .trim();
+}
+
 /**
  * ✅ 추가: "제1동" 처럼 '제'+숫자1개+'동' 이면 '제'만 제거
  * - 예: "화곡 제1동" -> "화곡 1동"
@@ -402,13 +454,13 @@ function buildResultRow(row, searchResult, dongOfficeColumn) {
 }
 
 // 단일 API 호출
-async function searchAddressOnce(keyword) {
+async function searchAddressOnce(keyword, countPerPage = 1) {
   try {
     const response = await axios.get(JUSO_API_URL, {
       params: {
         confmKey: JUSO_API_KEY,
         currentPage: 1,
-        countPerPage: 1,
+        countPerPage,
         keyword: keyword,
         resultType: "json",
         addInfoYn: "Y",
@@ -417,6 +469,7 @@ async function searchAddressOnce(keyword) {
     });
 
     const result = response.data?.results;
+    const totalCount = Number(result?.common?.totalCount || 0);
     if (result?.common?.errorCode === "0" && result?.juso?.length > 0) {
       const juso = result.juso[0];
       return {
@@ -427,62 +480,112 @@ async function searchAddressOnce(keyword) {
         roadAddr: juso.roadAddr,
         jibunAddr: juso.jibunAddr,
         dong: juso.hemdNm,
+        totalCount,
       };
     }
     return {
       success: false,
       error: result?.common?.errorMessage || "주소를 찾을 수 없습니다",
+      totalCount,
     };
   } catch (error) {
     return { success: false, error: getAddressErrorMessage(error) };
   }
 }
 
-async function searchAddressWithBackoff(keyword, diagnosticContext) {
-  const processed = preprocessAddress(keyword);
-  if (!processed) {
-    return { success: false, error: "주소가 비어 있습니다", attemptCount: 0 };
-  }
+// baseKeyword로 시작해 뒤 토큰을 하나씩 잘라가며 재검색한다.
+// requireUnique가 true면(구/군 정보를 뺀 검색) countPerPage를 늘려 후보가 유일할 때만 채택한다.
+async function runBackoffChain(
+  baseKeyword,
+  dongCandidates,
+  diagnosticContext,
+  startAttempt,
+  { requireUnique = false, phase = "with-gu" } = {}
+) {
+  const countPerPage = requireUnique ? 5 : 1;
+  let attempt = startAttempt;
 
-  let attempt = 1;
-  let result = await searchAddressOnce(processed);
-  if (diagnosticContext?.verbose) {
-    logDiagnostic(diagnosticContext, "search attempt", {
-      attempt,
-      keyword: processed,
-      success: result.success,
-      error: result.success ? null : result.error,
-    });
-  }
+  const tryKeyword = async (keyword) => {
+    const result = await searchAddressOnce(keyword, countPerPage);
+    const plausible =
+      result.success &&
+      (!requireUnique || result.totalCount === 1) &&
+      isPlausibleBackoffMatch(dongCandidates, keyword, result);
 
-  if (result.success) {
-    return { ...result, attemptCount: attempt };
-  }
-
-  const tokens = tokenizeForBackoff(processed);
-  while (tokens.length > 1) {
-    tokens.pop();
-    attempt += 1;
-    const shortened = tokens.join(" ").trim();
-    result = await searchAddressOnce(shortened);
     if (diagnosticContext?.verbose) {
       logDiagnostic(diagnosticContext, "search attempt", {
         attempt,
-        keyword: shortened,
+        phase,
+        keyword,
         success: result.success,
+        totalCount: result.totalCount,
+        rejectedAsImplausible: result.success && !plausible,
         error: result.success ? null : result.error,
       });
     }
 
-    if (result.success) {
-      return { ...result, attemptCount: attempt };
+    return { result, plausible };
+  };
+
+  let { result, plausible } = await tryKeyword(baseKeyword);
+  if (plausible) {
+    return { success: true, result, attempt };
+  }
+
+  const tokens = tokenizeForBackoff(baseKeyword);
+  while (tokens.length > 1) {
+    tokens.pop();
+    attempt += 1;
+    const shortened = tokens.join(" ").trim();
+    ({ result, plausible } = await tryKeyword(shortened));
+    if (plausible) {
+      return { success: true, result, attempt };
     }
+  }
+
+  return { success: false, result, attempt };
+}
+
+async function searchAddressWithBackoff(keyword, diagnosticContext) {
+  const preprocessed = preprocessAddress(keyword);
+  if (!preprocessed) {
+    return { success: false, error: "주소가 비어 있습니다", attemptCount: 0 };
+  }
+
+  // 인천 주소는 번지를 지우기 전에 구 이름부터 제거해, tail-backoff가
+  // "인천서구청" 같은 옛 구 이름이 들어간 건물명에 낚이는 것을 원천 차단한다.
+  const processed = stripIncheonGuToken(preprocessed);
+
+  const dongCandidates = extractDongCandidates(processed);
+
+  const primary = await runBackoffChain(processed, dongCandidates, diagnosticContext, 1, {
+    requireUnique: false,
+    phase: "with-gu",
+  });
+
+  if (primary.success) {
+    return { ...primary.result, attemptCount: primary.attempt };
+  }
+
+  // 구/군 이름이 개편되어 더 이상 검색되지 않는 경우를 대비해,
+  // 구/군 토큰을 제거하고 한 번 더 시도한다. 정보 손실로 인한 오매칭을 막기 위해
+  // 검색 결과가 유일한 후보일 때(totalCount === 1)만 채택한다.
+  const guDropped = stripSingleGuGunToken(processed);
+  const finalAttempt = guDropped
+    ? await runBackoffChain(guDropped, dongCandidates, diagnosticContext, primary.attempt + 1, {
+        requireUnique: true,
+        phase: "gu-dropped",
+      })
+    : primary;
+
+  if (finalAttempt.success) {
+    return { ...finalAttempt.result, attemptCount: finalAttempt.attempt };
   }
 
   return {
     success: false,
     error: "주소를 찾을 수 없습니다",
-    attemptCount: attempt,
+    attemptCount: finalAttempt.attempt,
   };
 }
 
