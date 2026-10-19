@@ -147,6 +147,40 @@ function removeJePrefixIfNeeded(value) {
   return s.replace(/제([0-9])동/g, "$1동");
 }
 
+function addDongSuffix(value) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed || /[동읍면]$/.test(trimmed)) return trimmed;
+  return trimmed + "동";
+}
+
+function normalizeDongOfficeHeaders(worksheet) {
+  if (!worksheet["!ref"]) return;
+  const range = xlsx.utils.decode_range(worksheet["!ref"]);
+  const matches = [];
+
+  for (let column = range.s.c; column <= range.e.c; column++) {
+    const cell = worksheet[xlsx.utils.encode_cell({ r: range.s.r, c: column })];
+    if (!cell) continue;
+    const normalized = String(cell.v ?? "").replace(/\s+/g, "");
+    if (normalized.includes("열람동사무소") && !normalized.endsWith("_원본")) {
+      matches.push({ cell, normalized });
+    }
+  }
+
+  if (matches.length > 1) {
+    throw Object.assign(new Error("열람 동사무소 컬럼이 중복되어 있습니다. 하나만 남겨주세요."), {
+      status: 400,
+      code: "DONG_OFFICE_COLUMN_DUPLICATED",
+    });
+  }
+
+  for (const { cell, normalized } of matches) {
+    cell.v = normalized;
+    cell.t = "s";
+    delete cell.w;
+  }
+}
+
 function getAddressErrorMessage(error) {
   if (error?.code === "ECONNABORTED") {
     return "주소 조회 시간 초과";
@@ -437,17 +471,18 @@ function buildResultRow(row, searchResult, dongOfficeColumn) {
 
   if (dongOfficeColumn) {
     const originalValue = row[dongOfficeColumn];
+    const officeValue = addDongSuffix(originalValue);
     const gwanhalDong = resultRow.관할동 || "";
 
     resultRow[`${dongOfficeColumn}_원본`] = originalValue;
 
     if (/제동$/.test(gwanhalDong)) {
-      resultRow[dongOfficeColumn] = String(originalValue ?? "").replace(
+      resultRow[dongOfficeColumn] = officeValue.replace(
         /제제([0-9])동/g,
         "제$1동"
       );
     } else {
-      resultRow[dongOfficeColumn] = removeJePrefixIfNeeded(originalValue);
+      resultRow[dongOfficeColumn] = removeJePrefixIfNeeded(officeValue);
     }
   }
 
@@ -669,6 +704,7 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
     const workbook = xlsx.read(normalizedBuffer, { type: "buffer" });
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
+    normalizeDongOfficeHeaders(worksheet);
     const data = xlsx.utils.sheet_to_json(worksheet);
     diagnosticContext.totalRows = data.length;
 
@@ -698,7 +734,7 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
     }
 
     const dongOfficeColumn = Object.keys(data[0]).find((key) =>
-      key.replace(/\s+/g, "").includes("열람동사무소")
+      key.includes("열람동사무소") && !key.endsWith("_원본")
     );
 
     const results = [];
