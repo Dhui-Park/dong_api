@@ -61,7 +61,34 @@ function preprocessAddress(address) {
   // "외N필지" 또는 "외 N필지" 패턴이 있으면 그 앞부분만 남김
   return String(address)
     .replace(/외\s*\d+\s*필지.*$/, "")
+    .replace(/([가-힣])(\d+-\d+)/g, "$1 $2")
     .trim();
+}
+
+
+// 검색 결과는 원본의 지역과 지번/도로명 번호를 모두 보존해야 한다.
+function addressIdentity(value) {
+  const text = preprocessAddress(value).replace(/\s+/g, " ");
+  const match = text.match(/(?:^|\s)([가-힣0-9·.]+(?:동|읍|면|리|가|대로|로|길))\s*(산\s*)?(\d+)(?:-(\d+))?(?:번지)?(?=\s|$)/);
+  if (!match) return null;
+  const prefix = text.slice(0, match.index).trim().split(/\s+/).filter(Boolean);
+  const aliases = { 서울: "서울특별시", 경기: "경기도", 강원: "강원특별자치도", 전북: "전북특별자치도", 충남: "충청남도", 충북: "충청북도", 경남: "경상남도", 경북: "경상북도", 전남: "전라남도", 부산: "부산광역시", 대구: "대구광역시", 인천: "인천광역시", 광주: "광주광역시", 대전: "대전광역시", 울산: "울산광역시", 제주: "제주특별자치도", 세종: "세종특별자치시" };
+  return { name: match[1], mountain: Boolean(match[2]), main: Number(match[3]), sub: Number(match[4] || 0), prefix: prefix.map(t => aliases[t] || t), end: match.index + match[0].length, road: /(?:대로|로|길)$/.test(match[1]) };
+}
+
+function matchesOriginalAddress(original, result) {
+  const expected = addressIdentity(original);
+  if (!expected) return false;
+  const actualText = expected.road ? result.roadAddr : result.jibunAddr;
+  const actual = addressIdentity(actualText || "");
+  return Boolean(actual && expected.name === actual.name && expected.mountain === actual.mountain && expected.main === actual.main && expected.sub === actual.sub && expected.prefix.every(t => actual.prefix.includes(t)));
+}
+
+function validateAddressResult(original, result) {
+  if (!addressIdentity(original) || (result.success && !matchesOriginalAddress(original, result))) {
+    return { success: false, error: "주소 확인 필요", attemptCount: result.attemptCount || 0 };
+  }
+  return result;
 }
 
 function tokenizeForBackoff(text) {
@@ -69,7 +96,7 @@ function tokenizeForBackoff(text) {
   const tokens = [];
 
   for (const t of raw) {
-    const m = t.match(/^(\d+(?:-\d+)?)([^\d].+)$/);
+    const m = t.match(/^(\d+(?:-\d+)?)([가-힣].*)$/);
     if (m) {
       tokens.push(m[1], m[2]);
     } else {
@@ -199,6 +226,8 @@ function normalizeSearchResult(searchResult) {
   if (!error || error === "정상" || error === "주소를 찾을 수 없습니다") {
     return "미매칭";
   }
+
+  if (error === "주소 확인 필요") return "주소 확인 필요";
 
   if (error.includes("검색어가 너무 깁니다")) {
     return "검색어 초과";
@@ -430,6 +459,7 @@ function serializeJob(job) {
 
 function shouldRetryInPrecise(status) {
   return (
+    status === "주소 확인 필요" ||
     status === "미매칭" ||
     status === "검색어 초과" ||
     status === "조회 시간 초과" ||
@@ -538,6 +568,9 @@ async function runBackoffChain(
   startAttempt,
   { requireUnique = false, phase = "with-gu" } = {}
 ) {
+  const identity = addressIdentity(baseKeyword);
+  if (!identity) return { success: false, result: { success: false, error: "주소 확인 필요" }, attempt: startAttempt };
+  const core = baseKeyword.slice(0, identity.end).trim();
   const countPerPage = requireUnique ? 5 : 1;
   let attempt = startAttempt;
 
@@ -546,7 +579,7 @@ async function runBackoffChain(
     const plausible =
       result.success &&
       (!requireUnique || result.totalCount === 1) &&
-      isPlausibleBackoffMatch(dongCandidates, keyword, result);
+      matchesOriginalAddress(baseKeyword, result);
 
     if (diagnosticContext?.verbose) {
       logDiagnostic(diagnosticContext, "search attempt", {
@@ -573,6 +606,7 @@ async function runBackoffChain(
     tokens.pop();
     attempt += 1;
     const shortened = tokens.join(" ").trim();
+    if (shortened.length < core.length) break;
     ({ result, plausible } = await tryKeyword(shortened));
     if (plausible) {
       return { success: true, result, attempt };
@@ -632,11 +666,14 @@ async function searchAddress(keyword, diagnosticContext) {
   }
 
   if (diagnosticContext?.mode === "precise") {
-    return searchAddressWithBackoff(processed, diagnosticContext);
+    const result = await searchAddressWithBackoff(processed, diagnosticContext);
+    const validated = validateAddressResult(processed, result);
+    if (!validated.success && validated.error === "주소를 찾을 수 없습니다") validated.error = "주소 확인 필요";
+    return validated;
   }
 
   const result = await searchAddressOnce(processed);
-  return { ...result, attemptCount: 1 };
+  return validateAddressResult(processed, { ...result, attemptCount: 1 });
 }
 
 function buildDownloadFileName(originalName) {
