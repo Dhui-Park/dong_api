@@ -7,7 +7,77 @@ const path = require("path");
 const crypto = require("crypto");
 const iconv = require("iconv-lite");
 
+const { performance, monitorEventLoopDelay } = require("node:perf_hooks");
 const app = express();
+const diagnosticBootId = crypto.randomUUID();
+const activeDiagnosticJobs = new Set();
+const stageTotals = new Map();
+function trace(event, details = {}) {
+  if (process.env.DIAGNOSTIC_OLD_SEARCH !== "true") return;
+  console.log(JSON.stringify({ event, time: new Date().toISOString(), bootId: diagnosticBootId, ...details }));
+}
+function beginStage(jobId, stage) {
+  const start = performance.now();
+  const cpu = process.cpuUsage();
+  trace("stage.start", { jobId, stage, memory: process.memoryUsage() });
+  return () => trace("stage.end", { jobId, stage, elapsedMs: performance.now() - start,
+    cpuMicros: process.cpuUsage(cpu), memory: process.memoryUsage() });
+}
+function measureStage(jobId, stage, action) {
+  if (stage === "status.update" || stage === "row.transform") {
+    if (!DIAGNOSTIC_OLD_SEARCH) return action();
+    const started = performance.now();
+    try { return action(); } finally {
+      const key = jobId + ":" + stage;
+      const total = stageTotals.get(key) || { jobId, stage, count: 0, elapsedMs: 0 };
+      total.count++;
+      total.elapsedMs += performance.now() - started;
+      stageTotals.set(key, total);
+    }
+  }
+  const end = beginStage(jobId, stage);
+  try { return action(); } finally { end(); }
+}
+const pollMetrics = { count: 0, elapsedMs: 0, bytes: 0 };
+let resourceTimer;
+let loopMonitor;
+let lastCpu;
+function startResourceMonitor() {
+  if (!DIAGNOSTIC_OLD_SEARCH || resourceTimer) return;
+  loopMonitor = monitorEventLoopDelay({ resolution: 20 });
+  loopMonitor.enable();
+  lastCpu = process.cpuUsage();
+  resourceTimer = setInterval(() => {
+    trace("resources", { activeJobs: [...activeDiagnosticJobs], memory: process.memoryUsage(),
+      cpuMicros: process.cpuUsage(lastCpu), eventLoopMaxMs: loopMonitor.max / 1e6,
+      polls: { ...pollMetrics } });
+    lastCpu = process.cpuUsage();
+    loopMonitor.reset();
+  }, 5000);
+  resourceTimer.unref();
+}
+app.use((req, res, next) => {
+  const isUpload = req.method === "POST" && req.path === "/api/process-excel-jobs";
+  const isStatus = req.method === "GET" && (req.path === "/api/process-status/latest" ||
+    /^\/api\/process-excel-jobs\/[^/]+$/.test(req.path));
+  const isDownload = req.method === "GET" && req.path.endsWith("/download");
+  const started = performance.now();
+  if (isUpload) {
+    req.diagnosticRequestId = crypto.randomUUID();
+    trace("upload.start", { requestId: req.diagnosticRequestId });
+  }
+  res.once("finish", () => {
+    if (isStatus) {
+      pollMetrics.count++;
+      pollMetrics.elapsedMs += performance.now() - started;
+      pollMetrics.bytes += Number(res.getHeader("content-length") || 0);
+    }
+    if (isUpload || isDownload) trace(isUpload ? "upload.response" : "download.response", {
+      requestId: req.diagnosticRequestId, status: res.statusCode, elapsedMs: performance.now() - started,
+      bytes: Number(res.getHeader("content-length") || 0) });
+  });
+  next();
+});
 const PORT = process.env.PORT || 3000;
 const EXCEL_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -48,13 +118,8 @@ function sendApiError(res, status, message, code) {
 }
 
 function logApiError(context, error, details = {}) {
-  const errorName = error?.name || "Error";
-  const message = error?.message || String(error);
-  console.error(`[${context}]`, {
-    name: errorName,
-    message,
-    ...details,
-  });
+  trace("error", { context, code: error?.code || null, status: error?.status || error?.response?.status || null });
+
 }
 
 function preprocessAddress(address) {
@@ -266,7 +331,10 @@ function logDiagnostic(context, message, details = {}) {
     return;
   }
 
-  console.log(`[diagnostic:${context.requestId}] ${message}`, details);
+  const safeDetails = JSON.parse(JSON.stringify(details, (key, value) =>
+    ["address", "keyword", "fileName"].includes(key) ? undefined : value
+  ));
+  console.log(`[diagnostic:${context.requestId}] ${message}`, safeDetails);
 }
 
 function getTopRows(rowSummaries, field, limit = 3) {
@@ -344,6 +412,9 @@ function inferLikelyCause(status) {
     return "처리 상태 정보가 없습니다.";
   }
 
+  if (status.status === "running") return "주소 조회를 진행 중입니다.";
+  if (status.status === "failed") return status.error || "작업 처리에 실패했습니다.";
+  if (status.status === "completed") return "처리가 완료되었습니다.";
   const elapsedMs = status.elapsedMs || 0;
   const mostRetried = status.mostRetriedRows || [];
   const slowestRows = status.slowestRows || [];
@@ -367,7 +438,7 @@ function inferLikelyCause(status) {
   }
 
   if (status.status === "running" || elapsedMs >= 30000) {
-    return "요청 처리 시간이 길어 앞단 프록시에서 502를 반환했을 가능성이 높습니다.";
+    return status.status === "running" ? "주소 조회를 진행 중입니다." : "작업 상태를 확인해주세요.";
   }
 
   return "일시적인 서버 또는 네트워크 문제일 수 있습니다.";
@@ -405,7 +476,7 @@ function updateJob(jobId, overrides = {}) {
     return null;
   }
 
-  const nextJob = buildJobSnapshot(job, overrides);
+  const nextJob = measureStage(jobId, "status.update", () => buildJobSnapshot(job, overrides));
   processJobs.set(jobId, nextJob);
   latestJobId = jobId;
   return nextJob;
@@ -520,7 +591,24 @@ function buildResultRow(row, searchResult, dongOfficeColumn) {
 }
 
 // 단일 API 호출
-async function searchAddressOnce(keyword, countPerPage = 1) {
+function recordApiCall(context, details) {
+  if (!context) return;
+  const stats = context.apiStats;
+  if (stats) {
+    stats.callCount += 1;
+    stats.totalElapsedMs += details.elapsedMs;
+    stats.averageElapsedMs = Math.round(stats.totalElapsedMs / stats.callCount);
+    stats.maxElapsedMs = Math.max(stats.maxElapsedMs, details.elapsedMs);
+    if (details.networkCode === "ECONNABORTED" || details.networkCode === "ETIMEDOUT") stats.timeoutCount += 1;
+    if (!details.success) stats.failureCount += 1;
+  }
+  if (context.verbose) logDiagnostic(context, "api call", {
+    rowNumber: context.lastStartedRow, phase: context.mode, ...details,
+  });
+}
+
+async function searchAddressOnce(keyword, countPerPage = 1, diagnosticContext) {
+  const startedAt = Date.now();
   try {
     const response = await axios.get(JUSO_API_URL, {
       params: {
@@ -535,6 +623,13 @@ async function searchAddressOnce(keyword, countPerPage = 1) {
     });
 
     const result = response.data?.results;
+    recordApiCall(diagnosticContext, {
+      elapsedMs: Date.now() - startedAt,
+      httpStatus: response.status,
+      apiCode: result?.common?.errorCode ?? null,
+      networkCode: null,
+      success: result?.common?.errorCode === "0" && Boolean(result?.juso?.length),
+    });
     const totalCount = Number(result?.common?.totalCount || 0);
     if (result?.common?.errorCode === "0" && result?.juso?.length > 0) {
       const juso = result.juso[0];
@@ -555,6 +650,13 @@ async function searchAddressOnce(keyword, countPerPage = 1) {
       totalCount,
     };
   } catch (error) {
+    recordApiCall(diagnosticContext, {
+      elapsedMs: Date.now() - startedAt,
+      httpStatus: error.response?.status ?? null,
+      apiCode: null,
+      networkCode: error.code || "UNKNOWN",
+      success: false,
+    });
     return { success: false, error: getAddressErrorMessage(error) };
   }
 }
@@ -575,7 +677,7 @@ async function runBackoffChain(
   let attempt = startAttempt;
 
   const tryKeyword = async (keyword) => {
-    const result = await searchAddressOnce(keyword, countPerPage);
+    const result = await searchAddressOnce(keyword, countPerPage, diagnosticContext);
     const plausible =
       result.success &&
       (!requireUnique || result.totalCount === 1) &&
@@ -585,11 +687,10 @@ async function runBackoffChain(
       logDiagnostic(diagnosticContext, "search attempt", {
         attempt,
         phase,
-        keyword,
         success: result.success,
         totalCount: result.totalCount,
         rejectedAsImplausible: result.success && !plausible,
-        error: result.success ? null : result.error,
+        successOnly: Boolean(result.success),
       });
     }
 
@@ -672,7 +773,7 @@ async function searchAddress(keyword, diagnosticContext) {
     return validated;
   }
 
-  const result = await searchAddressOnce(processed);
+  const result = await searchAddressOnce(processed, 1, diagnosticContext);
   return validateAddressResult(processed, { ...result, attemptCount: 1 });
 }
 
@@ -715,13 +816,20 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
     rowSummaries: [],
     failedRowsCount: 0,
     mode: "fast",
+    apiStats: { callCount: 0, cacheHits: 0, totalElapsedMs: 0, averageElapsedMs: 0, maxElapsedMs: 0, timeoutCount: 0, failureCount: 0 },
   };
 
   const statusRowSummaries = [];
+  activeDiagnosticJobs.add(jobId);
+  startResourceMonitor();
+  const endJob = beginStage(jobId, "analysis");
+  let endPass;
+
 
   try {
     updateJob(jobId, {
       status: "running",
+      apiStats: diagnosticContext.apiStats,
       phase: "fast",
       startedAt: diagnosticContext.startedAt,
       elapsedMs: 0,
@@ -734,15 +842,15 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
 
     let normalizedBuffer = fileBuffer;
     if (originalName.toLowerCase().endsWith(".csv")) {
-      const content = iconv.decode(fileBuffer, "cp949");
-      normalizedBuffer = Buffer.from(content, "utf-8");
+      const content = measureStage(jobId, "csv.decode", () => iconv.decode(fileBuffer, "cp949"));
+      normalizedBuffer = measureStage(jobId, "csv.buffer", () => Buffer.from(content, "utf-8"));
     }
 
-    const workbook = xlsx.read(normalizedBuffer, { type: "buffer" });
+    const workbook = measureStage(jobId, "excel.parse", () => xlsx.read(normalizedBuffer, { type: "buffer" }));
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
-    normalizeDongOfficeHeaders(worksheet);
-    const data = xlsx.utils.sheet_to_json(worksheet);
+    measureStage(jobId, "headers.normalize", () => normalizeDongOfficeHeaders(worksheet));
+    const data = measureStage(jobId, "rows.convert", () => xlsx.utils.sheet_to_json(worksheet));
     diagnosticContext.totalRows = data.length;
 
     updateJob(jobId, {
@@ -784,6 +892,7 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
       mode: "auto-2pass",
     });
 
+    endPass = beginStage(jobId, "fast");
     for (let i = 0; i < data.length; i++) {
       const row = data[i];
       const address = row[addressColumn];
@@ -805,6 +914,7 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
       if (address) {
         const cacheKey = `fast:${preprocessAddress(address)}`;
         searchResult = addressCache.get(cacheKey);
+        if (searchResult) diagnosticContext.apiStats.cacheHits += 1;
 
         if (!searchResult) {
           searchResult = await searchAddress(address, { ...diagnosticContext, mode: "fast" });
@@ -813,7 +923,7 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
         attemptCount = searchResult.attemptCount || 0;
       }
 
-      const resultRow = buildResultRow(row, searchResult, dongOfficeColumn);
+      const resultRow = measureStage(jobId, "row.transform", () => buildResultRow(row, searchResult, dongOfficeColumn));
 
       results.push(resultRow);
       diagnosticContext.lastCompletedRow = rowNumber;
@@ -865,6 +975,8 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
       rowSummaries: statusRowSummaries,
     });
 
+    endPass();
+    endPass = beginStage(jobId, "precise");
     for (let j = 0; j < retryIndexes.length; j++) {
       const index = retryIndexes[j];
       const row = data[index];
@@ -884,6 +996,7 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
 
       const cacheKey = `precise:${preprocessAddress(address)}`;
       let searchResult = addressCache.get(cacheKey);
+      if (searchResult) diagnosticContext.apiStats.cacheHits += 1;
 
       if (!searchResult) {
         searchResult = await searchAddress(address, {
@@ -894,7 +1007,7 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
       }
       attemptCount = searchResult.attemptCount || 0;
 
-      const resultRow = buildResultRow(row, searchResult, dongOfficeColumn);
+      const resultRow = measureStage(jobId, "row.transform", () => buildResultRow(row, searchResult, dongOfficeColumn));
       const previousStatus = results[index].검색결과;
       results[index] = resultRow;
       diagnosticContext.lastCompletedRow = rowNumber;
@@ -932,18 +1045,22 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
       }
     }
 
+    endPass();
+    endPass = null;
     const newWorkbook = xlsx.utils.book_new();
-    const newWorksheet = xlsx.utils.json_to_sheet(results);
+    const newWorksheet = measureStage(jobId, "result.sheet", () => xlsx.utils.json_to_sheet(results));
     xlsx.utils.book_append_sheet(newWorkbook, newWorksheet, "Result");
 
-    const resultBuffer = xlsx.write(newWorkbook, {
+    const resultBuffer = measureStage(jobId, "result.serialize", () => xlsx.write(newWorkbook, {
       type: "buffer",
       bookType: "xlsx",
-    });
+    }));
+    trace("result.buffer", { jobId, bytes: resultBuffer.length, rows: results.length, cacheEntries: addressCache.size });
 
     logDiagnostic(diagnosticContext, "request completed summary", {
       totalRows: data.length,
       totalElapsedMs: Date.now() - diagnosticContext.startedAt,
+      apiStats: diagnosticContext.apiStats,
       lastStartedRow: diagnosticContext.lastStartedRow,
       lastCompletedRow: diagnosticContext.lastCompletedRow,
       failedRowsCount: diagnosticContext.failedRowsCount,
@@ -986,6 +1103,22 @@ async function processExcelJob(jobId, fileBuffer, originalName, mode) {
       fileName: originalName,
       mode,
     });
+  } finally {
+    if (endPass) endPass();
+    endJob();
+    trace("job.summary", { jobId, apiStats: diagnosticContext.apiStats });
+    for (const [key, total] of stageTotals) {
+      if (total.jobId === jobId) {
+        trace("stage.aggregate", total);
+        stageTotals.delete(key);
+      }
+    }
+    activeDiagnosticJobs.delete(jobId);
+    if (!activeDiagnosticJobs.size && resourceTimer) {
+      clearInterval(resourceTimer);
+      resourceTimer = null;
+      loopMonitor.disable();
+    }
   }
 }
 
@@ -1002,6 +1135,7 @@ app.post(
       );
     }
 
+    trace("upload.accepted", { requestId: req.diagnosticRequestId, bytes: req.file.size, activeJobs: [...activeDiagnosticJobs] });
     clearPreviousJobs();
 
     const job = saveJob(
@@ -1011,6 +1145,7 @@ app.post(
       })
     );
 
+    trace("job.queued", { requestId: req.diagnosticRequestId, jobId: job.jobId, node: process.version, commit: process.env.RENDER_GIT_COMMIT || null });
     setImmediate(() => {
       processExcelJob(job.jobId, req.file.buffer, req.file.originalname, "auto");
     });

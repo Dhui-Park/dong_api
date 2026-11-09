@@ -6,6 +6,7 @@ const source = fs.readFileSync(require.resolve('../server.js'), 'utf8');
 const context = { require, process, Buffer, console, __dirname: require('node:path').resolve(__dirname, '..') };
 vm.createContext(context);
 vm.runInContext(source.slice(0, source.lastIndexOf('app.listen(')), context);
+const realSearchAddressOnce = context.searchAddressOnce;
 test('normalizes attached parcel numbers', () => {
   assert.equal(context.preprocessAddress('서울 잠원동60-3'), '서울 잠원동 60-3');
   assert.equal(context.preprocessAddress('서울 잠원동 60-3'), '서울 잠원동 60-3');
@@ -25,4 +26,35 @@ test('does not search below the parcel boundary', async () => {
   await context.runBackoffChain('서울 서초구 잠원동 60-3 메이플자이 205동 2004호', [], null, 1);
   assert.equal(keywords.at(-1), '서울 서초구 잠원동 60-3');
   assert.ok(keywords.every(k => k.includes('잠원동 60-3')));
+});
+
+test('running status does not infer a proxy error', () => {
+  assert.equal(context.inferLikelyCause({ status: 'running', elapsedMs: 90000 }), '주소 조회를 진행 중입니다.');
+});
+test('records API outcomes without logging request secrets', async () => {
+  const axios = require('axios');
+  const original = axios.get;
+  const originalLog = console.log;
+  const logs = [];
+  const diagnostic = { enabled: true, verbose: true, apiStats: {callCount: 0, totalElapsedMs: 0, maxElapsedMs: 0, timeoutCount: 0, failureCount: 0} };
+  try {
+    console.log = (...args) => logs.push(args);
+    for (const outcome of [
+      {status: 200, data: {results: {common: {errorCode: '0'}, juso: [{}]}}},
+      {status: 200, data: {results: {common: {errorCode: 'E0001'}}}},
+      Object.assign(new Error('secret-address'), {code: 'ECONNABORTED'}),
+      Object.assign(new Error('secret-address'), {response: {status: 503}})
+    ]) {
+      axios.get = async () => { if (outcome instanceof Error) throw outcome; return outcome; };
+      await realSearchAddressOnce('secret-address', 1, diagnostic);
+    }
+    assert.equal(diagnostic.apiStats.callCount, 4);
+    assert.equal(diagnostic.apiStats.timeoutCount, 1);
+    assert.equal(diagnostic.apiStats.failureCount, 3);
+    assert.equal(JSON.stringify(logs).includes('secret-address'), false);
+    assert.equal(logs[3][1].httpStatus, 503);
+  } finally {
+    axios.get = original;
+    console.log = originalLog;
+  }
 });
