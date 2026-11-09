@@ -1300,5 +1300,11 @@ app.use((error, req, res, next) => {
 });
 
 app.listen(PORT, () => {
+  if (process.env.JUSO_CONNECTION_DIAGNOSTIC === "true") {
+    const { runConnectionDiagnostics } = require("./connection-diagnostic");
+    runConnectionDiagnostics({ apiUrl: JUSO_API_URL, apiKey: JUSO_API_KEY }).catch(() => {
+      console.error(JSON.stringify({ event: "connection.diagnostic", errorCode: "DIAGNOSTIC_ERROR" }));
+    });
+  }
   console.log(`서버가 http://localhost:${PORT} 에서 실행 중입니다`);
 });
