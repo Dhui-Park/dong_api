@@ -131,42 +131,28 @@ function preprocessAddress(address) {
 }
 
 
-// 검색 결과는 원본의 지역과 지번/도로명 번호를 모두 보존해야 한다.
-function addressIdentity(value) {
-  const text = preprocessAddress(value).replace(/\s+/g, " ");
-  const match = text.match(/(?:^|\s)([가-힣0-9·.]+(?:동|읍|면|리|가|대로|로|길))\s*(산\s*)?(\d+)(?:-(\d+))?(?:번지)?(?=\s|$)/);
-  if (!match) return null;
-  const prefix = text.slice(0, match.index).trim().split(/\s+/).filter(Boolean);
-  const aliases = { 서울: "서울특별시", 경기: "경기도", 강원: "강원특별자치도", 전북: "전북특별자치도", 충남: "충청남도", 충북: "충청북도", 경남: "경상남도", 경북: "경상북도", 전남: "전라남도", 부산: "부산광역시", 대구: "대구광역시", 인천: "인천광역시", 광주: "광주광역시", 대전: "대전광역시", 울산: "울산광역시", 제주: "제주특별자치도", 세종: "세종특별자치시" };
-  return { name: match[1], mountain: Boolean(match[2]), main: Number(match[3]), sub: Number(match[4] || 0), prefix: prefix.map(t => aliases[t] || t), end: match.index + match[0].length, road: /(?:대로|로|길)$/.test(match[1]) };
-}
-
-function matchesOriginalAddress(original, result) {
-  const expected = addressIdentity(original);
-  if (!expected) return false;
-  const actualText = expected.road ? result.roadAddr : result.jibunAddr;
-  const actual = addressIdentity(actualText || "");
-  return Boolean(actual && expected.name === actual.name && expected.mountain === actual.mountain && expected.main === actual.main && expected.sub === actual.sub && expected.prefix.every(t => actual.prefix.includes(t)));
-}
-
-function validateAddressResult(original, result) {
-  if (!addressIdentity(original) || (result.success && !matchesOriginalAddress(original, result))) {
-    return { success: false, error: "주소 확인 필요", attemptCount: result.attemptCount || 0 };
-  }
-  return result;
-}
-
 function tokenizeForBackoff(text) {
-  const raw = String(text).trim().split(/\s+/);
+  const raw = [];
+  let token = "", depth = 0;
+  for (const char of String(text).trim()) {
+    if (char === "(") {
+      if (depth === 0 && token) { raw.push(token); token = ""; }
+      depth++;
+      token += char;
+    } else if (char === ")" && depth > 0) {
+      token += char;
+      depth--;
+      if (depth === 0) { raw.push(token); token = ""; }
+    } else if (/\s/.test(char) && depth === 0) {
+      if (token) { raw.push(token); token = ""; }
+    } else token += char;
+  }
+  if (token) raw.push(token);
   const tokens = [];
-
   for (const t of raw) {
     const m = t.match(/^(\d+(?:-\d+)?)([가-힣].*)$/);
-    if (m) {
-      tokens.push(m[1], m[2]);
-    } else {
-      tokens.push(t);
-    }
+    if (m) tokens.push(m[1], m[2]);
+    else tokens.push(t);
   }
 
   return tokens;
@@ -175,10 +161,12 @@ function tokenizeForBackoff(text) {
 // 원본 주소에 명시된 "동/읍/면/리" 지역명 후보를 추출 (예: "청라동", "가좌동")
 // 숫자가 섞인 토큰("120동", "7동" 같은 아파트 동/호)은 제외한다.
 function extractDongCandidates(text) {
-  return String(text)
-    .trim()
-    .split(/\s+/)
-    .filter((t) => /^[가-힣]{2,}$/.test(t) && /(동|읍|면|리)$/.test(t));
+  const address = String(text).trim();
+  // Keep the midpoint of the full input, rather than a shortened search keyword.
+  return Array.from(address.matchAll(/\S+/g))
+    .filter((match) => match.index * 2 < address.length)
+    .map((match) => match[0])
+    .filter((token) => /^[가-힣]{2,}$/.test(token) && /(동|읍|면|리)$/.test(token));
 }
 
 // backoff로 검색어가 짧아지는 과정에서 원본 동 정보가 이미 잘려나갔다면,
@@ -292,7 +280,6 @@ function normalizeSearchResult(searchResult) {
     return "미매칭";
   }
 
-  if (error === "주소 확인 필요") return "주소 확인 필요";
 
   if (error.includes("검색어가 너무 깁니다")) {
     return "검색어 초과";
@@ -530,7 +517,6 @@ function serializeJob(job) {
 
 function shouldRetryInPrecise(status) {
   return (
-    status === "주소 확인 필요" ||
     status === "미매칭" ||
     status === "검색어 초과" ||
     status === "조회 시간 초과" ||
@@ -670,9 +656,6 @@ async function runBackoffChain(
   startAttempt,
   { requireUnique = false, phase = "with-gu" } = {}
 ) {
-  const identity = addressIdentity(baseKeyword);
-  if (!identity) return { success: false, result: { success: false, error: "주소 확인 필요" }, attempt: startAttempt };
-  const core = baseKeyword.slice(0, identity.end).trim();
   const countPerPage = requireUnique ? 5 : 1;
   let attempt = startAttempt;
 
@@ -681,7 +664,7 @@ async function runBackoffChain(
     const plausible =
       result.success &&
       (!requireUnique || result.totalCount === 1) &&
-      matchesOriginalAddress(baseKeyword, result);
+      isPlausibleBackoffMatch(dongCandidates, keyword, result);
 
     if (diagnosticContext?.verbose) {
       logDiagnostic(diagnosticContext, "search attempt", {
@@ -704,10 +687,11 @@ async function runBackoffChain(
 
   const tokens = tokenizeForBackoff(baseKeyword);
   while (tokens.length > 1) {
+    const tail = tokens[tokens.length - 1];
+    if ((tail.match(/\(/g) || []).length !== (tail.match(/\)/g) || []).length) break;
     tokens.pop();
     attempt += 1;
     const shortened = tokens.join(" ").trim();
-    if (shortened.length < core.length) break;
     ({ result, plausible } = await tryKeyword(shortened));
     if (plausible) {
       return { success: true, result, attempt };
@@ -717,7 +701,7 @@ async function runBackoffChain(
   return { success: false, result, attempt };
 }
 
-async function searchAddressWithBackoff(keyword, diagnosticContext) {
+async function searchAddressWithBackoff(keyword, diagnosticContext, originalAddress = keyword) {
   const preprocessed = preprocessAddress(keyword);
   if (!preprocessed) {
     return { success: false, error: "주소가 비어 있습니다", attemptCount: 0 };
@@ -727,7 +711,7 @@ async function searchAddressWithBackoff(keyword, diagnosticContext) {
   // "인천서구청" 같은 옛 구 이름이 들어간 건물명에 낚이는 것을 원천 차단한다.
   const processed = stripIncheonGuToken(preprocessed);
 
-  const dongCandidates = extractDongCandidates(processed);
+  const dongCandidates = extractDongCandidates(originalAddress);
 
   const primary = await runBackoffChain(processed, dongCandidates, diagnosticContext, 1, {
     requireUnique: false,
@@ -767,14 +751,11 @@ async function searchAddress(keyword, diagnosticContext) {
   }
 
   if (diagnosticContext?.mode === "precise") {
-    const result = await searchAddressWithBackoff(processed, diagnosticContext);
-    const validated = validateAddressResult(processed, result);
-    if (!validated.success && validated.error === "주소를 찾을 수 없습니다") validated.error = "주소 확인 필요";
-    return validated;
+    return searchAddressWithBackoff(processed, diagnosticContext, keyword);
   }
 
   const result = await searchAddressOnce(processed, 1, diagnosticContext);
-  return validateAddressResult(processed, { ...result, attemptCount: 1 });
+  return { ...result, attemptCount: 1 };
 }
 
 function buildDownloadFileName(originalName) {

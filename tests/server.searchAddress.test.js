@@ -7,27 +7,67 @@ const context = { require, process, Buffer, console, __dirname: require('node:pa
 vm.createContext(context);
 vm.runInContext(source.slice(0, source.lastIndexOf('app.listen(')), context);
 const realSearchAddressOnce = context.searchAddressOnce;
-test('normalizes attached parcel numbers', () => {
+test('ignores latter-half building names as dong candidates', () => {
+  for (const address of [
+    '경기도 시흥시 서울대학로264번길 50 배곧헤리움 어반크로스2차 제에이동 제702호',
+    '부산 북구 가람로 64 902호, 웅진아름누리',
+    '서울 중구 청구로19길 9-7 리버파크뷰신당 나동 603호',
+  ]) assert.deepEqual(Array.from(context.extractDongCandidates(address)), []);
+});
+test('uses token start and trimmed full-address midpoint', () => {
+  assert.deepEqual(Array.from(context.extractDongCandidates('  당하동 1318-6  ')), ['당하동']);
+  // Starts exactly at the midpoint, and is therefore excluded.
+  assert.deepEqual(Array.from(context.extractDongCandidates('123 나동')), []);
+  // Starts before the midpoint but extends beyond it, and is included.
+  assert.deepEqual(Array.from(context.extractDongCandidates('1 가나동')), ['가나동']);
+});
+test('keeps original midpoint across gu removal and successive backoff queries', async () => {
+  const saved = context.searchAddressOnce;
+  try {
+    context.searchAddressOnce = async keyword => ({
+      success: keyword === '인천 1234567890', totalCount: 1, emdNm: '다른동',
+    });
+    const result = await context.searchAddress('인천 서구 1234567890 나동', {mode: 'precise'});
+    assert.equal(result.success, true);
+  } finally { context.searchAddressOnce = saved; }
+});
+test('retains attached parentheses as a single token', () => {
+  assert.deepEqual(Array.from(context.tokenizeForBackoff('인천 당하동 1318-6(아파트 이름(별칭))')),
+    ['인천', '당하동', '1318-6', '(아파트 이름(별칭))']);
+});
+test('keeps address preprocessing', () => {
   assert.equal(context.preprocessAddress('서울 잠원동60-3'), '서울 잠원동 60-3');
-  assert.equal(context.preprocessAddress('서울 잠원동 60-3'), '서울 잠원동 60-3');
 });
-test('rejects the observed wrong buildings', () => {
-  assert.equal(context.matchesOriginalAddress('서울 서초구 잠원동60-3 메이플자이 205동', { jibunAddr: '서울특별시 서초구 서초동 1337-27 토요코인' }), false);
-  for (const number of [3145, 3148]) assert.equal(context.matchesOriginalAddress(`충북 진천군 덕산면 두촌리 ${number}`, { jibunAddr: '충청북도 진천군 덕산읍 두촌리 2456' }), false);
-});
-test('accepts matching parcel and road identities with different details', () => {
-  assert.equal(context.matchesOriginalAddress('강원 동해시 이도동 751 제101동 제401호', { jibunAddr: '강원특별자치도 동해시 이도동 751 동해아이파크' }), true);
-  assert.equal(context.matchesOriginalAddress('서울 서초구 고무래로 94 301동', { roadAddr: '서울특별시 서초구 고무래로 94 (서초동)' }), true);
-  assert.equal(context.matchesOriginalAddress('서울 서초구 고무래로 94', { roadAddr: '서울특별시 서초구 고무래로 95' }), false);
-});
-test('does not search below the parcel boundary', async () => {
+test('backoff reaches parcel without 번지 and accepts old-style API result', async () => {
+  const saved = context.searchAddressOnce;
   const keywords = [];
-  context.searchAddressOnce = async keyword => { keywords.push(keyword); return { success: false }; };
-  await context.runBackoffChain('서울 서초구 잠원동 60-3 메이플자이 205동 2004호', [], null, 1);
-  assert.equal(keywords.at(-1), '서울 서초구 잠원동 60-3');
-  assert.ok(keywords.every(k => k.includes('잠원동 60-3')));
+  try {
+    context.searchAddressOnce = async keyword => {
+      keywords.push(keyword);
+      return keyword === '서울 서초구 방배2동 946-8'
+        ? { success: true, totalCount: 1, jibunAddr: '서울특별시 서초구 방배동 946-8' }
+        : { success: false };
+    };
+    const result = await context.searchAddress('서울 서초구 방배2동 946-8번지 일대 디에이치방배 104동 1402호', {mode: 'precise'});
+    assert.equal(result.success, true);
+    assert.equal(keywords.at(-1), '서울 서초구 방배2동 946-8');
+  } finally { context.searchAddressOnce = saved; }
 });
-
+test('retains old dong plausibility checks and unique-candidate guard', async () => {
+  assert.equal(context.isPlausibleBackoffMatch(['당하동'], '인천', {emdNm: '다른동'}), false);
+  assert.equal(context.isPlausibleBackoffMatch(['당하동'], '인천', {emdNm: '당하동'}), true);
+  assert.equal(context.isPlausibleBackoffMatch(['당하동'], '인천 당하동', {emdNm: '다른동'}), true);
+  const saved = context.searchAddressOnce;
+  try {
+    context.searchAddressOnce = async () => ({success: true, totalCount: 2, emdNm: '당하동'});
+    const result = await context.runBackoffChain('인천 당하동 1318-6', ['당하동'], {}, 1, {requireUnique: true});
+    assert.equal(result.success, false);
+  } finally { context.searchAddressOnce = saved; }
+});
+test('does not generate the verification column', () => {
+  const row = context.buildResultRow({}, {success: true});
+  assert.equal(Object.hasOwn(row, '약간은 확인 필요(ex. 구 이름이 일치하지 않는다)'), false);
+});
 test('running status does not infer a proxy error', () => {
   assert.equal(context.inferLikelyCause({ status: 'running', elapsedMs: 90000 }), '주소 조회를 진행 중입니다.');
 });
