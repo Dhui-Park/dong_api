@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>주소 관할동 찾기_v5</title>
+    <title>주소 관할동 찾기_v6_Singapore</title>
     <style>
       * {
         box-sizing: border-box;
@@ -13,7 +13,8 @@
 
       body {
         font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-        background: linear-gradient(135deg, #ffe4ec 0%, #f8bbd0 100%);
+        background: #dce8ed url("/singapore_background.png") center / cover
+          no-repeat;
         min-height: 100vh;
         display: flex;
         justify-content: center;
@@ -204,11 +205,15 @@
   </head>
   <body>
     <div class="container">
-      <h1>주소 관할동 찾기_v5.3</h1>
+      <h1>주소 관할동 찾기_v6_Singapore</h1>
       <p class="subtitle">
-        엑셀 파일의 주소로 관할 동사무소를 자동으로 찾아드립니다
+        엑셀 파일의 주소로 관할 동사무소를 싱가포르에서 자동으로 찾아드립니다
       </p>
       <p class="subtitle">
+        ( 261110 서버의 위치를 US -> 싱가포르로 변경하였습니다.)
+      </p>
+
+      <!-- <p class="subtitle">
         ( 261109 한글 이후에 바로 숫자-숫자 형태 오는 것 띄어쓰기 하기 )
       </p>
       <p class="subtitle">
@@ -223,7 +228,7 @@
       <p class="subtitle">
         ( 260519 병목현상 재발 -> 1차 빠른 모드로 api 호출 -> 2차 정밀 모드로
         api 호출 )
-      </p>
+      </p> -->
 
       <div class="upload-area" id="uploadArea">
         <div class="upload-icon">📁</div>
